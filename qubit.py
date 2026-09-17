@@ -1,248 +1,150 @@
 import numpy as np
+import matplotlib as mpl
 import matplotlib.pyplot as plt
+from matplotlib.colors import to_hex
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
 from scipy.integrate import solve_ivp
-import scipy.special
 from matplotlib.widgets import Slider
+from qutip import Bloch
+
+from matplotlib import cm
+
+# Fixed colour normalization
+nrm = mpl.colors.LogNorm(vmin=1e-3, vmax=1)
+cmap = cm.inferno
 
 
 # =============================================================
-# 4-Level Transmon — Rotating Frame
+# 3-LEVEL TRANSMON
 # =============================================================
 
-class FourLevelTransmon:
+class ThreeLevelTransmon:
 
     def __init__(
         self,
-        f01=6.62820323,
-        f12=6.32820323,
-        f23=6.02820323
+        f01=5.11722,             # GHz
+        anharmonicity=-0.31528   # GHz
     ):
-
-        self.N = 4
-
-        # -----------------------------------------------------
-        # Transition frequencies
-        # -----------------------------------------------------
-
         self.f01 = f01
-        self.f12 = f12
-        self.f23 = f23
+        self.anharmonicity = anharmonicity
 
-        # -----------------------------------------------------
-        # Anharmonicity / rotating-frame detunings
-        # -----------------------------------------------------
-
-        # Drive is assumed to be at f01
-        self.delta2 = self.f12 - self.f01
-
-        # |3> is two transitions above |0>
-        self.delta3 = (
-            self.f12
-            + self.f23
-            - 2 * self.f01
-        )
-
-        # -----------------------------------------------------
-        # Rotating-frame static Hamiltonian
+        # In the rotating frame at f01:
         #
-        # H/hbar in GHz
+        # E0 = 0
+        # E1 = 0
+        # E2 = Delta
+        #
+        # Convert GHz -> rad/ns
+        self.Delta = 2 * np.pi * anharmonicity
+
+        # -----------------------------------------------------
+        # Static Hamiltonian
         # -----------------------------------------------------
 
         self.H0 = np.diag([
             0.0,
             0.0,
-            self.delta2,
-            self.delta3
+            self.Delta
         ]).astype(complex)
 
         # -----------------------------------------------------
-        # Transmon matrix-element factors
-        #
-        # 0 <-> 1 : 1
-        # 1 <-> 2 : sqrt(2)
-        # 2 <-> 3 : sqrt(3)
+        # Transition operators
         # -----------------------------------------------------
 
-        self.matrix_elements = np.array([
-            1.0,
-            np.sqrt(2),
-            np.sqrt(3)
-        ])
+        # sigma_x01
+        self.sx01 = np.array([
+            [0, 1, 0],
+            [1, 0, 0],
+            [0, 0, 0]
+        ], dtype=complex)
+
+        # sigma_x12
+        self.sx12 = np.array([
+            [0, 0, 0],
+            [0, 0, np.sqrt(2)],
+            [0, np.sqrt(2), 0]
+        ], dtype=complex)
+
+        # sigma_y01
+        self.sy01 = np.array([
+            [0, -1j, 0],
+            [1j, 0, 0],
+            [0, 0, 0]
+        ], dtype=complex)
+
+        # sigma_y12
+        self.sy12 = np.array([
+            [0, 0, 0],
+            [0, 0, -1j*np.sqrt(2)],
+            [0, 1j*np.sqrt(2), 0]
+        ], dtype=complex)
 
         # -----------------------------------------------------
-        # sigma-x operators
+        # Operators appearing in the paper's Hamiltonian
         # -----------------------------------------------------
 
-        self.sigma_x = np.zeros(
-            (self.N, self.N),
-            dtype=complex
-        )
-
-        for j in range(1, self.N):
-
-            g = self.matrix_elements[j - 1]
-
-            self.sigma_x[j, j - 1] = g
-            self.sigma_x[j - 1, j] = g
-
-        # -----------------------------------------------------
-        # sigma-y operators
-        # -----------------------------------------------------
-
-        self.sigma_y = np.zeros(
-            (self.N, self.N),
-            dtype=complex
-        )
-
-        for j in range(1, self.N):
-
-            g = self.matrix_elements[j - 1]
-
-            self.sigma_y[j, j - 1] = -1j * g
-            self.sigma_y[j - 1, j] = 1j * g
+        self.Sx = self.sx01 + self.sx12
+        self.Sy = self.sy01 + self.sy12
 
     # =========================================================
-    # Print spectrum
+    # Hamiltonian
     # =========================================================
 
-    def print_spectrum(self):
+    def hamiltonian(self, Omega_x, Omega_y):
+        """
+        Rotating-frame Hamiltonian:
 
-        print("4-level transmon")
-        print("----------------")
-        print()
+        H/hbar =
+            Delta |2><2|
+            + Omega_x/2 * (sigma_x01 + sigma_x12)
+            + Omega_y/2 * (sigma_y01 + sigma_y12)
 
-        print(f"f01 = {self.f01:.8f} GHz")
-        print(f"f12 = {self.f12:.8f} GHz")
-        print(f"f23 = {self.f23:.8f} GHz")
+        Omega_x and Omega_y are supplied in GHz.
+        Internally they are converted to rad/ns.
+        """
 
-        print()
+        # GHz -> rad/ns
+        Omega_x_rad = 2 * np.pi * Omega_x
+        Omega_y_rad = 2 * np.pi * Omega_y
 
-        print(
-            f"anharmonicity = "
-            f"{self.f12 - self.f01:.8f} GHz"
+        H = (
+            self.H0
+            + 0.5 * Omega_x_rad * self.Sx
+            + 0.5 * Omega_y_rad * self.Sy
         )
 
-        print()
-
-        print(
-            f"Delta2 = "
-            f"{self.delta2:.8f} GHz"
-        )
-
-        print(
-            f"Delta3 = "
-            f"{self.delta3:.8f} GHz"
-        )
+        return H
 
     # =========================================================
-    # Simulation
+    # Time evolution
     # =========================================================
 
     def simulate(
         self,
         t,
-        I,
-        Q=None,
-        amplitude=1.0,
-        carrier_frequency=None,
-        phase=0.0,
+        Omega_x,
+        Omega_y,
         initial_state=0
     ):
-
         """
-        Simulate the 4-level transmon in the rotating frame.
+        Solve the time-dependent Schrodinger equation.
 
-        Hamiltonian:
-
-        H/hbar =
-            Delta2 |2><2|
-          + Delta3 |3><3|
-          + Omega_x(t)/2 * X
-          + Omega_y(t)/2 * Y
-
-        where
-
-        Omega_x(t) = amplitude * I(t)
-        Omega_y(t) = amplitude * Q(t)
-
-        Frequencies are in GHz and time is in ns.
+        d|psi>/dt = -i H(t)|psi>
         """
 
-        if carrier_frequency is None:
-            carrier_frequency = self.f01
-
-        # -----------------------------------------------------
-        # Initial state
-        # -----------------------------------------------------
-
-        psi0 = np.zeros(
-            self.N,
-            dtype=complex
-        )
-
+        psi0 = np.zeros(3, dtype=complex)
         psi0[initial_state] = 1.0
-
-        # -----------------------------------------------------
-        # Convert carrier frequency to angular frequency
-        # -----------------------------------------------------
-
-        omega_d = 2 * np.pi * carrier_frequency
-
-        # -----------------------------------------------------
-        # Q = 0 if not supplied
-        # -----------------------------------------------------
-
-        if Q is None:
-            Q = np.zeros_like(t)
-
-        # -----------------------------------------------------
-        # Schrödinger equation
-        # -----------------------------------------------------
 
         def rhs(time, psi):
 
-            # Interpolate pulse
-            I_t = np.interp(
-                time,
-                t,
-                I
-            )
+            # Interpolate IQ pulses at solver time
+            Ox = np.interp(time, t, Omega_x)
+            Oy = np.interp(time, t, Omega_y)
 
-            Q_t = np.interp(
-                time,
-                t,
-                Q
-            )
+            H = self.hamiltonian(Ox, Oy)
 
-            # -------------------------------------------------
-            # Envelope Rabi frequencies
-            # -------------------------------------------------
-
-            Omega_x = amplitude * I_t
-            Omega_y = amplitude * Q_t
-
-            # -------------------------------------------------
-            # Rotating-frame Hamiltonian
-            # -------------------------------------------------
-
-            H = (
-                self.H0
-                + (Omega_x / 2.0) * self.sigma_x
-                + (Omega_y / 2.0) * self.sigma_y
-            )
-
-            # -------------------------------------------------
-            # H is in GHz
-            # t is in ns
-            #
-            # dpsi/dt = -i 2pi H psi
-            # -------------------------------------------------
-
-            return -1j * 2 * np.pi * H @ psi
-
-        # -----------------------------------------------------
-        # Solve
-        # -----------------------------------------------------
+            return -1j * H @ psi
 
         result = solve_ivp(
             rhs,
@@ -261,16 +163,36 @@ class FourLevelTransmon:
 
     @staticmethod
     def populations(psi):
-
         return np.abs(psi)**2
 
+    # =========================================================
+    # Spectrum
+    # =========================================================
+
+    def print_spectrum(self):
+
+        print("3-level transmon")
+        print("----------------")
+        print(f"f01 = {self.f01:.5f} GHz")
+        print(
+            f"Delta/2pi = "
+            f"{self.anharmonicity:.5f} GHz"
+        )
+        print(
+            f"f12 = "
+            f"{self.f01 + self.anharmonicity:.5f} GHz"
+        )
+        print()
+
 
 # =============================================================
-# Pulse shapes
+# PULSE DEFINITIONS
 # =============================================================
-
 
 def gaussian(t, T, sigma):
+    """
+    Gaussian envelope centered at T/2.
+    """
 
     return np.exp(
         -(t - T / 2)**2
@@ -278,622 +200,530 @@ def gaussian(t, T, sigma):
     )
 
 
-def square(t, T, width=None):
+def gaussian_derivative(t, T, sigma):
+    """
+    dG/dt
+    """
 
-    if width is None:
-        width = T
+    G = gaussian(t, T, sigma)
 
-    center = T / 2
-
-    return np.where(
-        np.abs(t - center) <= width / 2,
-        1.0,
-        0.0
-    )
-
-
-def cosine_squared(t, T):
-
-    x = t / T
-
-    return np.where(
-        (x >= 0) & (x <= 1),
-        np.sin(np.pi * x)**2,
-        0.0
-    )
+    return -(
+        (t - T / 2)
+        / sigma**2
+    ) * G
 
 
-def blackman(t, T):
-
-    x = t / T
-
-    return np.where(
-        (x >= 0) & (x <= 1),
-
-        (
-            0.42
-            - 0.5 * np.cos(2 * np.pi * x)
-            + 0.08 * np.cos(4 * np.pi * x)
-        ),
-
-        0.0
-    )
-
-
-def gaussian_flat_top(
+def drag_pulse(
     t,
     T,
     sigma,
-    flat_fraction=0.5
-):
-
-    flat_width = flat_fraction * T
-
-    t_start = (T - flat_width) / 2
-    t_end = (T + flat_width) / 2
-
-    rise = 0.5 * (
-        1
-        + scipy.special.erf(
-            (t - t_start)
-            / (np.sqrt(2) * sigma)
-        )
-    )
-
-    fall = 0.5 * (
-        1
-        + scipy.special.erf(
-            (t_end - t)
-            / (np.sqrt(2) * sigma)
-        )
-    )
-
-    return rise * fall
-
-
-def drag(
-    t,
-    T,
-    sigma,
+    amplitude,
     beta
 ):
+    """
+    DRAG pulse:
 
-    # ---------------------------------------------------------
-    # I quadrature
-    # ---------------------------------------------------------
+        Omega_x = A G(t)
 
-    I = gaussian(
+        Omega_y = -A beta dG/dt
+
+    beta has units of time (ns).
+    """
+
+    G = gaussian(
         t,
         T,
         sigma
     )
 
-    # ---------------------------------------------------------
-    # Derivative
-    # ---------------------------------------------------------
-
-    dI_dt = np.gradient(
-        I,
-        t
+    dG = gaussian_derivative(
+        t,
+        T,
+        sigma
     )
 
-    # ---------------------------------------------------------
-    # DRAG quadrature
-    # ---------------------------------------------------------
+    Omega_x = amplitude * G
+    Omega_y = -amplitude * beta / q.anharmonicity * dG
 
-    Q = -beta * dI_dt
-
-    return I, Q
+    return Omega_x, Omega_y
 
 
 # =============================================================
-# Pulse selector
+# CREATE TRANSMON
 # =============================================================
 
-
-def make_pulse(
-    name,
-    t,
-    T,
-    sigma,
-    beta=0.0
-):
-
-    if name == "gaussian":
-
-        I = gaussian(
-            t,
-            T,
-            sigma
-        )
-
-        Q = np.zeros_like(t)
-
-    elif name == "square":
-
-        I = square(
-            t,
-            T
-        )
-
-        Q = np.zeros_like(t)
-
-    elif name == "cosine_squared":
-
-        I = cosine_squared(
-            t,
-            T
-        )
-
-        Q = np.zeros_like(t)
-
-    elif name == "blackman":
-
-        I = blackman(
-            t,
-            T
-        )
-
-        Q = np.zeros_like(t)
-
-    elif name == "gaussian_flat_top":
-
-        I = gaussian_flat_top(
-            t,
-            T,
-            sigma,
-            flat_fraction=0.5
-        )
-
-        Q = np.zeros_like(t)
-
-    elif name == "drag":
-
-        I, Q = drag(
-            t,
-            T,
-            sigma,
-            beta
-        )
-
-    else:
-
-        raise ValueError(
-            f"Unknown pulse: {name}"
-        )
-
-    return I, Q
-
-
-# =============================================================
-# Create transmon
-# =============================================================
-
-q = FourLevelTransmon(
-    f01=6.62820323,
-    f12=6.32820323,
-    f23=6.02820323
+q = ThreeLevelTransmon(
+    f01=5.11722,
+    anharmonicity=-0.31528
 )
 
 q.print_spectrum()
 
 
 # =============================================================
-# Pulse parameters
+# INITIAL PARAMETERS
 # =============================================================
 
-T = 20.0          # ns
-sigma = T / 6     # ns
-T_max = 100.0      # Maximum duration allowed by slider
+T_max = 20.0       # ns
+
+T = 4.6           # ns
+sigma_fraction = 6
+
+amplitude = 0.2715   # GHz
+beta = 0.086         # ns
+
+
+# =============================================================
+# TIME AXIS
+# =============================================================
+
+N = 5000
 
 t = np.linspace(
     0,
     T_max,
-    50000
+    N
 )
 
 
 # =============================================================
-# Initial pulse parameters
+# CREATE INITIAL PULSE
 # =============================================================
 
-pulse_name = "drag"
+sigma = T / sigma_fraction
 
-amplitude = 0.025   # GHz
-beta = 0.5          # ns
+Omega_x = np.zeros_like(t)
+Omega_y = np.zeros_like(t)
 
+# Only generate pulse inside [0,T]
+pulse_mask = t <= T
 
-# =============================================================
-# Generate pulse
-# =============================================================
-
-I, Q = make_pulse(
-    pulse_name,
-    t=t,
-    T=T,
-    sigma=sigma,
-    beta=beta
+Omega_x[pulse_mask], Omega_y[pulse_mask] = drag_pulse(
+    t[pulse_mask],
+    T,
+    sigma,
+    amplitude,
+    beta
 )
 
 
 # =============================================================
-# Initial simulation
+# INITIAL SIMULATION
 # =============================================================
 
 psi = q.simulate(
     t=t,
-    I=I,
-    Q=Q,
-    amplitude=amplitude,
-    carrier_frequency=q.f01
+    Omega_x=Omega_x,
+    Omega_y=Omega_y
 )
 
 P = q.populations(psi)
 
 
 # =============================================================
-# Figure
+# FIGURE
 # =============================================================
 
-fig, axes = plt.subplots(
+fig = plt.figure(figsize=(12, 7))
+
+# Left side: three time-domain plots
+gs = fig.add_gridspec(
     3,
-    1,
-    figsize=(10, 9),
-    sharex=True
+    2,
+    width_ratios=[1.5, 1.0],
+    hspace=0.35,
+    wspace=0.25
 )
 
-plt.subplots_adjust(
-    bottom=0.20,
-    hspace=0.35
-)
+ax_pop = fig.add_subplot(gs[0, 0])
+ax_iq = fig.add_subplot(gs[1, 0])
+ax_drive = fig.add_subplot(gs[2, 0])
 
+# Right side: Bloch sphere
+ax_bloch = fig.add_axes(
+    [0.67, 0.38, 0.30, 0.52],
+    projection="3d"
+)
+cax = fig.add_axes([0.58, 0.43, 0.01, 0.43])
+
+sm = mpl.cm.ScalarMappable(norm=nrm, cmap=cmap)
+sm.set_array([])
+
+cbar = fig.colorbar(sm, cax=cax)
+cbar.set_label(r"Leakage $P_2$")
 
 # =============================================================
-# Population plot
+# BLOCH SPHERE
 # =============================================================
 
-lines = []
+b = Bloch(fig=fig, axes=ax_bloch)
 
-for i in range(4):
+b.sphere_alpha = 0.05
+b.sphere_color = "#0091ff"
 
-    line, = axes[0].plot(
-        t,
-        P[:, i],
-        label=f"|{i}>"
-    )
+ax_bloch.view_init(elev=0, azim=90)
 
-    lines.append(line)
+# Initial Bloch trajectory
+c0 = psi[:, 0]
+c1 = psi[:, 1]
 
+bx = 2 * np.real(np.conj(c0) * c1)
+by = 2 * np.imag(np.conj(c0) * c1)
+bz = np.abs(c0)**2 - np.abs(c1)**2
 
-axes[0].set_ylabel(
-    "Population"
-)
-
-axes[0].set_title(
-    "4-level transmon — DRAG"
-)
-
-axes[0].set_ylim(
-    0,
-    1.05
-)
-
-axes[0].grid()
-axes[0].legend()
-
-
-# =============================================================
-# I/Q plot
-# =============================================================
-
-line_I, = axes[1].plot(
-    t,
-    amplitude * I,
-    label="I(t)"
-)
-
-line_Q, = axes[1].plot(
-    t,
-    amplitude * Q,
-    label="Q(t)"
-)
-
-axes[1].set_ylabel(
-    "Rabi amplitude (GHz)"
-)
-
-axes[1].grid()
-axes[1].legend()
-
-
-iq_max = max(
-    np.max(np.abs(amplitude * I)),
-    np.max(np.abs(amplitude * Q)),
-    1e-12
-)
-
-axes[1].set_ylim(
-    -1.15 * iq_max,
-    1.15 * iq_max
-)
-
-
-# =============================================================
-# Microwave waveform
-#
-# This is ONLY for visualization.
-#
-# The simulation itself is performed in the rotating frame.
-# =============================================================
-
-carrier = (
-    2
-    * np.pi
-    * q.f01
-    * t
-)
-
-waveform = amplitude * (
-    I * np.cos(carrier)
-    + Q * np.sin(carrier)
-)
-
-line_waveform, = axes[2].plot(
-    t,
-    waveform
-)
-
-axes[2].set_xlabel(
-    "Time (ns)"
-)
-
-axes[2].set_ylabel(
-    "Drive (GHz)"
-)
-
-axes[2].grid()
-
-
-waveform_max = max(
-    np.max(np.abs(waveform)),
-    1e-12
-)
-
-axes[2].set_ylim(
-    -1.15 * waveform_max,
-    1.15 * waveform_max
-)
-
-
-# =============================================================
-# Slider: amplitude
-# =============================================================
-
-ax_amp = plt.axes([
-    0.15,
-    0.08,
-    0.70,
-    0.03
+b.add_points([bx, by, bz])
+b.point_color
+b.point_size = [0.2]
+b.vector_color = ["black"]
+b.vector_width = 2
+b.add_vectors([
+    bx[-1],
+    by[-1],
+    bz[-1]
 ])
+colors = [to_hex(cmap(nrm(x))) for x in P[:, 2]]
+b.point_color = colors
 
-slider_amp = Slider(
-    ax_amp,
-    "Amplitude (GHz)",
-    0.001,
-    0.10,
-    valinit=amplitude,
-    valstep=0.001
+b.render()
+
+
+# =============================================================
+# AXIS 1: POPULATIONS
+# =============================================================
+
+line_P0, = ax_pop.plot(
+    t,
+    P[:, 0],
+    label=r"$|0\rangle$"
+)
+
+line_P1, = ax_pop.plot(
+    t,
+    P[:, 1],
+    label=r"$|1\rangle$"
+)
+
+line_P2, = ax_pop.plot(
+    t,
+    P[:, 2],
+    label=r"$|2\rangle$"
+)
+
+ax_pop.set_ylabel("Population")
+ax_pop.set_ylim(0, 1.05)
+ax_pop.grid()
+ax_pop.legend(loc="upper right")
+
+
+# =============================================================
+# AXIS 2: IQ COMPONENTS
+# =============================================================
+
+line_I, = ax_iq.plot(
+    t,
+    Omega_x,
+    label=r"$\Omega_x(t)$"
+)
+
+line_Q, = ax_iq.plot(
+    t,
+    Omega_y,
+    label=r"$\Omega_y(t)$"
+)
+
+ax_iq.set_ylabel("IQ amplitude (GHz)")
+ax_iq.grid()
+ax_iq.legend(loc="upper right")
+
+
+# =============================================================
+# AXIS 3: ACTUAL MICROWAVE DRIVE
+# =============================================================
+
+# The physical carrier is reconstructed only for plotting.
+#
+# drive(t) = Omega_x cos(2*pi*f01*t)
+#            - Omega_y sin(2*pi*f01*t)
+
+ax_drive.set_xlabel("Time (ns)")
+ax_drive.set_ylabel("Drive (GHz)")
+ax_drive.grid()
+
+omega01 = 2 * np.pi * q.f01
+
+drive = (
+    Omega_x * np.cos(omega01 * t)
+    - Omega_y * np.sin(omega01 * t)
+)
+
+line_drive, = ax_drive.plot(
+    t,
+    drive,
+    linewidth=0.8
 )
 
 
 # =============================================================
-# Slider: DRAG beta
-# =============================================================
-
-ax_beta = plt.axes([
-    0.15,
-    0.03,
-    0.70,
-    0.03
-])
-
-slider_beta = Slider(
-    ax_beta,
-    "DRAG β (ns)",
-    -5.0,
-    5.0,
-    valinit=beta,
-    valstep=0.05
-)
-
-
-# =============================================================
-# Slider: pulse duration
+# SLIDER AXES
 # =============================================================
 
 ax_T = plt.axes([
-    0.15,
-    0.13,
-    0.70,
-    0.03
+    0.65,     # x
+    0.28,     # y
+    0.30,     # width
+    0.025     # height
 ])
+
+ax_A = plt.axes([
+    0.65,
+    0.225,
+    0.30,
+    0.025
+])
+
+ax_beta = plt.axes([
+    0.65,
+    0.17,
+    0.30,
+    0.025
+])
+
+
+# =============================================================
+# SLIDERS
+# =============================================================
 
 slider_T = Slider(
     ax_T,
     "Pulse time (ns)",
-    5.0,
+    1.0,
     T_max,
     valinit=T,
     valstep=0.1
 )
 
+slider_A = Slider(
+    ax_A,
+    "Amplitude (GHz)",
+    0.001,
+    1,
+    valinit=amplitude,
+    valstep=0.0005
+)
 
-# =============================================================
-# Live numerical readout
-# =============================================================
-
-info_text = fig.text(
-    0.02,
-    0.955,
-    "",
-    fontsize=10
+slider_beta = Slider(
+    ax_beta,
+    "- DRAG beta (ns)",
+    0.0,
+    0.5,
+    valinit=beta,
+    valstep=0.0005
 )
 
 
 # =============================================================
-# Update function
+# UPDATE FUNCTION
 # =============================================================
 
 def update(val):
 
-    amplitude = slider_amp.val
-    beta = slider_beta.val
-    T = slider_T.val
+    T_new = slider_T.val
+    A_new = slider_A.val
+    beta_new = slider_beta.val
+
+    sigma_new = T_new / sigma_fraction
 
     # ---------------------------------------------------------
-    # Pulse width scales with pulse duration
+    # Recalculate pulse
     # ---------------------------------------------------------
 
-    sigma = T / 6
+    Ox_new = np.zeros_like(t)
+    Oy_new = np.zeros_like(t)
 
-    # ---------------------------------------------------------
-    # Generate new pulse
-    # ---------------------------------------------------------
+    mask = t <= T_new
 
-    I, Q = make_pulse(
-        "drag",
-        t=t,
-        T=T,
-        sigma=sigma,
-        beta=beta
+    Ox_new[mask], Oy_new[mask] = drag_pulse(
+        t[mask],
+        T_new,
+        sigma_new,
+        A_new,
+        beta_new
     )
 
     # ---------------------------------------------------------
-    # Simulate
+    # Recalculate evolution
     # ---------------------------------------------------------
 
-    psi = q.simulate(
+    psi_new = q.simulate(
         t=t,
-        I=I,
-        Q=Q,
-        amplitude=amplitude,
-        carrier_frequency=q.f01
+        Omega_x=Ox_new,
+        Omega_y=Oy_new
     )
 
-    P = q.populations(psi)
+    P_new = q.populations(psi_new)
+
+    # ---------------------------------------------------------
+    # Update Bloch sphere
+    # ---------------------------------------------------------
+
+    c0 = psi_new[:, 0]
+    c1 = psi_new[:, 1]
+
+    bx = 2 * np.real(np.conj(c0) * c1)
+    by = 2 * np.imag(np.conj(c0) * c1)
+    bz = np.abs(c0)**2 - np.abs(c1)**2
+
+    b.clear()
+
+    b.add_points([bx, by, bz])
+    b.point_size = [0.2]
+    b.add_vectors([
+        bx[-1],
+        by[-1],
+        bz[-1]
+    ])
+    b.vector_color = ["black"]
+    b.vector_width = 2
+
+    colors = [to_hex(cmap(nrm(x))) for x in P_new[:, 2]]
+    b.point_color = colors
+
+    b.render()
 
     # ---------------------------------------------------------
     # Update populations
     # ---------------------------------------------------------
 
-    for i in range(4):
+    line_P0.set_ydata(P_new[:, 0])
+    line_P1.set_ydata(P_new[:, 1])
+    line_P2.set_ydata(P_new[:, 2])
 
-        lines[i].set_ydata(
-            P[:, i]
-        )
+    # ---------------------------------------------------------
+    # Update IQ
+    # ---------------------------------------------------------
 
-    axes[0].set_ylim(
-        0,
-        1.05
+    line_I.set_ydata(Ox_new)
+    line_Q.set_ydata(Oy_new)
+
+    # ---------------------------------------------------------
+    # Update physical carrier
+    # ---------------------------------------------------------
+
+    drive_new = (
+        Ox_new * np.cos(omega01 * t)
+        - Oy_new * np.sin(omega01 * t)
     )
 
-    # ---------------------------------------------------------
-    # Update I/Q
-    # ---------------------------------------------------------
+    line_drive.set_ydata(drive_new)
 
-    I_plot = amplitude * I
-    Q_plot = amplitude * Q
-
-    line_I.set_ydata(I_plot)
-    line_Q.set_ydata(Q_plot)
+    # ---------------------------------------------------------
+    # Dynamically update y limits
+    # ---------------------------------------------------------
 
     iq_max = max(
-        np.max(np.abs(I_plot)),
-        np.max(np.abs(Q_plot)),
-        1e-12
+        np.max(np.abs(Ox_new)),
+        np.max(np.abs(Oy_new)),
+        1e-6
     )
 
-    axes[1].set_ylim(
-        -1.15 * iq_max,
-        1.15 * iq_max
+    ax_iq.set_ylim(
+        -1.2 * iq_max,
+        1.2 * iq_max
     )
 
-    # ---------------------------------------------------------
-    # Update microwave waveform
-    # ---------------------------------------------------------
-
-    waveform = amplitude * (
-        I * np.cos(carrier)
-        + Q * np.sin(carrier)
+    drive_max = max(
+        np.max(np.abs(drive_new)),
+        1e-6
     )
 
-    line_waveform.set_ydata(
-        waveform
-    )
-
-    waveform_max = max(
-        np.max(np.abs(waveform)),
-        1e-12
-    )
-
-    axes[2].set_ylim(
-        -1.15 * waveform_max,
-        1.15 * waveform_max
+    ax_drive.set_ylim(
+        -1.2 * drive_max,
+        1.2 * drive_max
     )
 
     # ---------------------------------------------------------
     # Update title
     # ---------------------------------------------------------
 
-    axes[0].set_title(
-        f"4-level transmon — DRAG "
-        f"(T = {T:.1f} ns)"
-    )
+    final = P_new[-1]
 
-    # ---------------------------------------------------------
-    # Live numerical readout
-    # ---------------------------------------------------------
+    leakage = final[2]
 
-    final = P[-1]
-
-    max_P2 = np.max(P[:, 2])
-    max_P3 = np.max(P[:, 3])
-
-    leakage = final[2] + final[3]
-
-    info_text.set_text(
-        f"A = {amplitude:.3f} GHz    "
-        f"β = {beta:.2f} ns    "
-        f"T = {T:.1f} ns    "
-        f"P0 = {final[0]:.4f}    "
-        f"P1 = {final[1]:.4f}    "
-        f"P2 = {final[2]:.4e}    "
-        f"P3 = {final[3]:.4e}    "
-        f"Leakage = {leakage:.4e}"
+    ax_pop.set_title(
+        "3-level transmon — DRAG   "
+        f"(T = {T_new:.1f} ns, "
+        f"A = {A_new:.4f} GHz, "
+        f"β = {beta_new:.2f} ns)\n"
+        f"P0 = {final[0]:.5f}   "
+        f"P1 = {final[1]:.5f}   "
+        f"P2 = {final[2]:.3e}   "
+        f"Leakage = {leakage:.3e}"
     )
 
     fig.canvas.draw_idle()
 
 
 # =============================================================
-# Connect sliders
+# CONNECT SLIDERS
 # =============================================================
 
-slider_amp.on_changed(
-    update
-)
-
-slider_beta.on_changed(
-    update
-)
-
-slider_T.on_changed(
-    update
-)
+slider_T.on_changed(update)
+slider_A.on_changed(update)
+slider_beta.on_changed(update)
 
 
 # =============================================================
-# Show
+# INITIAL Y LIMITS
+# =============================================================
+
+iq_max = max(
+    np.max(np.abs(Omega_x)),
+    np.max(np.abs(Omega_y))
+)
+
+ax_iq.set_ylim(
+    -1.2 * iq_max,
+    1.2 * iq_max
+)
+
+drive_max = np.max(np.abs(drive))
+
+ax_drive.set_ylim(
+    -1.2 * drive_max,
+    1.2 * drive_max
+)
+
+
+# =============================================================
+# INITIAL TITLE
+# =============================================================
+
+final = P[-1]
+
+ax_pop.set_title(
+    "3-level transmon — DRAG   "
+    f"(T = {T:.1f} ns, "
+    f"A = {amplitude:.4f} GHz, "
+    f"β = {beta:.2f} ns)\n"
+    f"P0 = {final[0]:.5f}   "
+    f"P1 = {final[1]:.5f}   "
+    f"P2 = {final[2]:.3e}   "
+    f"Leakage = {final[2]:.3e}"
+)
+
+
+# =============================================================
+# SHOW
 # =============================================================
 
 plt.show()
+
+# Lock in the values selected with the sliders
+T = slider_T.val
+amplitude = slider_A.val
+beta = slider_beta.val
+
+print("Final tuned parameters:")
+print(f"T       = {T:.6f} ns")
+print(f"Amplitude = {amplitude:.6f} GHz")
+print(f"beta    = {beta:.6f}")
